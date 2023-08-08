@@ -1,0 +1,675 @@
+---
+title: "covid_microbiome_analyses"
+author: "Fran Querdasi"
+date started: "2022-12-28"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, #set cache to be saved so that knitting is faster once it has been done once
+                      dev="svg", #set graphs to be saved as. svg (vector-based format rather than raster based formats like.jpg)
+                      dpi=1000) #set resolution to be 1000 dpi 
+#all graphs will be saved in "files" folder in same directory as script
+```
+
+# Setup
+## Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(vegan)
+  library(tidyverse)
+  library(stats)
+  library(phyloseq)
+  library(Polychrome)
+  library(mefa)
+  library(qiime2R)
+  library(microbiome)
+  library(fantaxtic)
+  library(car)
+  library(ggpubr)
+  library(readxl)
+  library(psych)
+  library(sjPlot)
+  library(reshape2)
+  library(mosaic)
+  library(summarytools) #for chi-square test and tables
+  library(Maaslin2)
+  library(RColorBrewer)
+  library(patchwork)
+  library(microViz) #for editing variables in phyloseq object
+})
+```
+
+## Load files
+```{r}
+#for phyloseq
+otu_table_path <- "../Full_Sample/shell_asv_table.qza"
+species_otu_path <- "../Full_Sample/species_level/species_table.qza"
+tree_path <- "../Full_Sample/tree.qza"
+taxonomy_path <- "../Full_Sample/shell_taxonomy.qza"
+metadata_path <- "covid_metadata_vars_test.tsv"
+
+#for maaslin2
+taxonomy_tsv <- "../Full_Sample/shell_taxonomy.tsv"
+genus_tax_file <- "../Full_Sample/genus_level/genus-table.csv"
+species_tax_file <- "../Full_Sample/species_level/species-table.csv"
+family_tax_file <- "../Full_Sample/family_level/family-table.csv"
+```
+
+# Data wrangling
+## Create phyloseq object
+```{r, results='hide'}
+# add pandemic string variable to metadata
+meta <- read_tsv(metadata_path) %>% 
+  dplyr::mutate(pandemic_str = ifelse(pandemic==0, "pre-pandemic", "pandemic"))
+
+# write the metadata file back (name with test first)
+write_tsv(meta, "covid_metadata_vars_test.tsv")
+
+#original ASV table 
+covid_phy_obj <- qza_to_phyloseq(
+  features=otu_table_path,
+  tree=tree_path,
+  taxonomy=taxonomy_path,
+  metadata=metadata_path
+)
+
+#view phyloseq object to check how it looks
+sample_data(covid_phy_obj)
+taxa_names(covid_phy_obj)
+sample_names(covid_phy_obj)
+
+covid_phy_obj #correct number of samples, metadata vars, etc. 
+sample_variables(covid_phy_obj)
+```
+
+# Initial data visualization: taxa abundance (at species level)
+
+```{r, warning=FALSE}
+# get top 25 most abundant taxa
+physeq_ttaxa <- get_top_taxa(physeq_obj = covid_phy_obj,
+                             n = 25,
+                             relative = TRUE,
+                             discard_other = TRUE)
+
+#group by pandemic status
+physeq_ttaxa_pandemic <- merge_samples(physeq_ttaxa, "pandemic")
+
+#create 'genus species' variable
+tmp_pandemic <- name_taxa(physeq_ttaxa_pandemic, species = TRUE)
+
+#barplot based on postnatal adversity group (NAs are removed), colors are strains, labels are species
+fantaxtic_bar(tmp_pandemic, color_by = "Species", label_by = "Species") +
+  xlab("Pandemic") +
+  ylab("Relative Abundance") #+
+  #scale_fill_manual(values=as.vector(glasbey(32)))
+```
+
+# Beta diversity analyses
+
+```{r}
+physeq_covid_analyses <- subset_samples(covid_phy_obj, pandemic != "NA" & sex != "NA" & avg_fats != "NA" & still_breastfeed != "NA" & method_delivery != "NA") #create a dataset that is complete on sex; necessary for distance matrix calculations to work (N=39 total)
+
+nsamples(physeq_covid_analyses) #N=39
+
+#get distance matrices (weighted unifrac, unweighted unifrac)
+set.seed(5049) #need to run this right before all Unifrac distance matrices calculations 
+wunifrac <- phyloseq::distance(physeq_covid_analyses, method = "wunifrac", type = "samples")
+set.seed(5049) 
+unifrac <- phyloseq::distance(physeq_covid_analyses, method = "unifrac", type = "samples")
+
+#get dataframe of metadata
+metadata_physeq_analyses <- data.frame(sample_data(physeq_covid_analyses)) #get data frame of metadata
+
+# determine the number of samples in each group
+metadata_physeq_analyses %>% group_by(pandemic) %>% summarize(n()) #26 pre-pandemic, 13 pandemic
+
+# test betadispersion assumption
+disp <- betadisper(wunifrac, metadata_physeq_analyses$pandemic)
+permutest(disp, permutations=how(nperm=9999)) #homogeneity of dispersion is violated *****
+disp_unifrac <- betadisper(unifrac, metadata_physeq_analyses$pandemic)
+permutest(disp_unifrac, permutations=how(nperm=9999)) #no violation
+
+#perform PERMANOVAs with each distance matrix (no covariates)
+set.seed(5049) #need to run this before Unifrac distance matrices calculations 
+adonis2(wunifrac~pandemic, data=metadata_physeq_analyses, permutations=9999)#ns
+set.seed(5049)
+adonis2(unifrac~pandemic, data=metadata_physeq_analyses, permutations=9999) #significant 
+
+# add covariates
+set.seed(5049)
+adonis2(wunifrac~pandemic + sex + avg_fats + still_breastfeed + method_delivery, data=metadata_physeq_analyses, permutations=9999) 
+set.seed(5049)
+adonis2(unifrac~pandemic + sex + avg_fats + still_breastfeed + method_delivery, data=metadata_physeq_analyses, permutations=9999) #significant
+```
+## Visualize beta divesrity results (Figure 3)
+This paper uses NMDS to visualize: https://www.researchgate.net/publication/308645859_Environment_and_host_species_shape_the_skin_microbiome_of_captive_neotropical_bats#pfb
+This tutorial describes how to create ordination plots: https://joey711.github.io/phyloseq/plot_ordination-examples.html
+```{r}
+#change the levels of pandemic string so that pre pandemic is first before pandemic
+physeq_covid_analyses_test <- physeq_covid_analyses %>% 
+  ps_mutate(pandemic_str_graph = factor(pandemic_str, levels=c("pre-pandemic", "pandemic")))
+
+#sample_data(physeq_covid_analyses_test)
+
+# visualize weighted unifrac
+ord <- ordinate(physeq_covid_analyses_test, "NMDS", "wunifrac")
+p1 = plot_ordination(physeq_covid_analyses_test, ord, type="samples", color="pandemic_str_graph") +
+  stat_ellipse() + 
+  labs(color= "Pandemic Group") + 
+  scale_color_brewer(palette = "Dark2") + #specify colorblind friendly color palette for color
+  theme_minimal() +
+  # theme( 
+  #   panel.grid.major.x = element_blank(),
+  #   panel.grid.minor.x = element_blank(),
+  #   panel.grid.major.y = element_blank(),
+  #   panel.grid.minor.y = element_blank(),
+  # ) +
+  theme(legend.position = "none") +
+  ggtitle('A) Weighted Unifrac')
+
+#pre-pandemic group appears more dispersed than pandemic group, most likely because there are just very few pandemic samples
+
+ggsave("figures/wunifrac.svg", height=4, width=6, dpi=1000)
+
+# visualize unweighted unifrac
+ord2 <- ordinate(physeq_covid_analyses_test, "NMDS", "unifrac")
+p2 = 
+  plot_ordination(physeq_covid_analyses_test, ord2, type="samples", color="pandemic_str_graph") +
+  stat_ellipse() +
+  labs(color= "Pandemic Group") + 
+  scale_color_brewer(palette = "Dark2") + #specify colorblind friendly color palette for color
+  theme_minimal() +
+  # theme( 
+  #   panel.grid.major.x = element_blank(),
+  #   panel.grid.minor.x = element_blank(),
+  #   panel.grid.major.y = element_blank(),
+  #   panel.grid.minor.y = element_blank(),
+  # ) +
+  ggtitle('B) Unweighted Unifrac')
+
+#no difference in homogeneity of dispersion bw groups; significant clustering by pandemic
+
+ggsave("figures/unifrac.svg", height=4, width=6, dpi=1000)
+
+# combine figures into one
+p1 + p2
+
+ggsave("figures/beta_diversiy_ellipses.svg", height=4, width=6, dpi=1000)
+```
+
+
+# Differential abundance analyses
+## Format data for differential abundance analyses
+```{r}
+#create genus-level taxonomy file
+genus_taxonomy <- as.data.frame(read.csv(genus_tax_file))
+rownames(genus_taxonomy) <- genus_taxonomy[,1]
+genus_taxonomy <- genus_taxonomy[,2:ncol(genus_taxonomy)]
+
+#transpose so taxa are on rows, samples on columns
+genus_taxonomy_t <- as.data.frame(t(genus_taxonomy))
+genus_taxonomy_t <- genus_taxonomy_t %>% 
+  rename('#SampleID' = '#OTU ID') 
+write_tsv(genus_taxonomy_t, "genus_tax_features_covid.tsv")
+
+#create species-level taxonomy file
+species_tax <- as.data.frame(read.csv(species_tax_file))
+rownames(species_tax) <- species_tax[,1]
+species_tax <- species_tax[,2:ncol(species_tax)]
+
+#transpose so taxa are on rows, samples on columns
+species_tax_t <- as.data.frame(t(species_tax))
+species_tax_t <- species_tax_t %>% 
+  rename('SampleID' = '#OTU ID') 
+write_tsv(species_tax_t, "species_tax_features_covid.tsv")
+
+#create string pandemic variable in metadata file to ensure that it is read as a categorical var
+covid_metadata <- read_tsv("covid_metadata_vars.tsv") %>% 
+  mutate(pandemic_str = if_else(pandemic==0, "pre", "during")) %>% 
+  rename('#SampleID' = SampleID)
+
+write_tsv(covid_metadata, "covid_metadata_vars_edited.tsv")
+
+#how many participants have average fat data?
+covid_metadata %>% dplyr::count(!is.na(avg_fats)) #41/55 have avg fat data
+
+#create family-level taxonomy file
+family_tax <- as.data.frame(read.csv(family_tax_file))
+rownames(family_tax) <- family_tax[,1]
+family_tax <- family_tax[,2:ncol(family_tax)]
+
+#transpose
+family_tax_t <- as.data.frame(t(family_tax))
+family_tax_t <- family_tax_t %>% 
+  rename('#SampleID' = '#OTU ID') 
+write_tsv(family_tax_t, "family_tax_features_covid.tsv")
+
+```
+# Differential abundance analyses comparing pre-pandemic and pandemic groups
+## Exploratory Analyses: genus level data
+Because we have a small sample, to reduce number of comparisons we filtered via maaslin2 to only look at taxa with non-zero abundance in at least 50% of samples (27/54 complete cases) 
+```{r, results='hide', warning=FALSE}
+# make dataset complete on all predictors
+covid_metadata <- read_tsv("covid_metadata_vars_edited.tsv")
+covid_metadata_complete <- covid_metadata %>% 
+  dplyr::filter(!is.na(pandemic) & !is.na(sex) & !is.na(avg_fats) & !is.na(method_delivery) & !is.na(still_breastfeed))
+
+# get a dataset of sampleIDs
+sampleids_complete <- covid_metadata_complete %>% dplyr::select('#SampleID')
+
+genus_tax_features_covid <- read_tsv("genus_tax_features_covid.tsv")
+genus_tax_features_covid_complete <- sampleids_complete %>% left_join(genus_tax_features_covid, by = "#SampleID")
+
+#without controlling for average fats (or any covariates)
+pandemic_genus <- Maaslin2(
+  input_data = "genus_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_genus_filtered",
+  min_abundance = 0,
+  min_prevalence = 0.5, #filter to only look at taxa with 50% non-zero values (non-zero in 17/34)
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str"),
+  standardize = TRUE
+)
+
+#controlling for average fat intake
+pandemic_genus_covs <- Maaslin2(
+  input_data = "genus_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_genus_filtered_controlfats",
+  min_abundance = 0,
+  min_prevalence = 0.5, #filter to only look at taxa with 50% non-zero values (non-zero in 17/34)
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str", "avg_fats"),
+  standardize = TRUE
+)
+
+# R&R from scientific reports: adding child sex, birthmode, and still breastfeeding to covariates
+pandemic_genus_covs <- Maaslin2(
+  input_data = "genus_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_genus_filtered_covariates_r1",
+  min_abundance = 0,
+  min_prevalence = 0.5, #filter to only look at taxa with 50% non-zero values (non-zero in 17/34)
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str", "avg_fats", "sex", "still_breastfeed", "method_delivery"),
+  standardize = TRUE
+)
+```
+
+### Graph significant genera results (Figure 5)
+```{r}
+#create smaller dataset with pandemic string variable relevant taxa
+covid_metadata_genus <- read_tsv("covid_metadata_vars_edited.tsv") %>% 
+  left_join(read_tsv("genus_tax_features_covid.tsv"), by = '#SampleID') 
+
+covid_metadata_genus <- covid_metadata_genus %>% 
+  dplyr::select(
+    '#SampleID',
+    ID,
+    dist322,
+    pandemic_str,
+    avg_fats,
+    still_breastfeed,
+    method_delivery,
+    sex,
+    'Bacteria;Proteobacteria;Gammaproteobacteria;Pasteurellales;Pasteurellaceae;Haemophilus',
+    contains("Shigella"),
+    contains("torques")
+  )
+
+#rename abundance variable for ease of plotting
+covid_metadata_genus <- covid_metadata_genus %>% 
+  dplyr::rename(
+    g__Haemophilus = 'Bacteria;Proteobacteria;Gammaproteobacteria;Pasteurellales;Pasteurellaceae;Haemophilus',
+    g__Shigella = "Bacteria;Proteobacteria;Gammaproteobacteria;Enterobacterales;Enterobacteriaceae;Escherichia-Shigella",
+    g__Ruminococcus_torques = "Bacteria;Firmicutes;Clostridia;Lachnospirales;Lachnospiraceae;[Ruminococcus] torques group"   
+  )
+
+#change the levels of pandemic string so that pre pandemic is first before during
+covid_metadata_genus$pandemic_str <- factor(covid_metadata_genus$pandemic_str, levels=c("pre", "during"))
+
+# create dataset that is complete on covariates
+covid_metadata_genus_complete <- covid_metadata_genus %>% dplyr::filter(!is.na(avg_fats) & !is.na(still_breastfeed) & !is.na(method_delivery) & !is.na(sex) & !is.na(pandemic_str))
+
+#GRAPH -- Haemophilus and pandemic 
+#haemophilus <- 
+  ggplot(covid_metadata_genus %>% filter(!is.na(pandemic_str)), aes(y = g__Haemophilus, x = pandemic_str, color=pandemic_str)) +
+geom_point(position=position_jitter(w=0.3, h=0), na.rm = TRUE) +
+  geom_boxplot(alpha=0.3, outlier.shape=NA, na.rm=TRUE, data=covid_metadata_genus %>% filter(!is.na(pandemic_str))) +
+  xlab("Pandemic Group") + ylab("Haemophilus Count (per sample)") + 
+  scale_x_discrete("Pandemic Group", labels = c("pre" = "Pre-Pandemic", "during" = "Pandemic")) +
+  scale_color_brewer(palette = "Dark2") + #specify colorblind friendly color palette for color
+  theme_minimal() +
+  theme( 
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+  ) +
+  theme(legend.position = "none") 
+  #+ ggtitle('A')
+
+ggsave("figures/Haemophilus_pandemic.svg", height=4, width=6, dpi=1000)
+
+# haemophilus in only complete subsample
+
+ ggplot(covid_metadata_genus_complete %>% filter(!is.na(pandemic_str)), aes(y = g__Haemophilus, x = pandemic_str, color=pandemic_str)) +
+geom_point(position=position_jitter(w=0.3, h=0), na.rm = TRUE) +
+  geom_boxplot(alpha=0.3, outlier.shape=NA, na.rm=TRUE, data=covid_metadata_genus %>% filter(!is.na(pandemic_str))) +
+  xlab("Pandemic Group") + ylab("Haemophilus Count (per sample)") + 
+  scale_x_discrete("Pandemic Group", labels = c("pre" = "Pre-Pandemic", "during" = "Pandemic")) +
+  scale_color_brewer(palette = "Dark2") + #specify colorblind friendly color palette for color
+  theme_minimal() +
+  theme( 
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+  ) +
+  theme(legend.position = "none") 
+  #+ ggtitle('A')
+
+ggsave("figures/Haemophilus_pandemic_complete.svg", height=4, width=6, dpi=1000)
+```
+
+## Exploratory Analyses: species level data
+```{r, results='hide', warning=FALSE}
+#without controlling for fat intake
+pandemic_species <- Maaslin2(
+  input_data = "species_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_species_filtered",
+  min_abundance = 0,
+  min_prevalence = 0.5, #filter to only look at taxa with 50% non-zero values (non-zero in 17/34)
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str"),
+  standardize = TRUE
+)
+
+#controlling for fat intake
+pandemic_species_covs <- Maaslin2(
+  input_data = "species_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_species_filtered_controlfats",
+  min_abundance = 0,
+  min_prevalence = 0.5, #filter to only look at taxa with 50% non-zero values (non-zero in 17/34)
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str", "avg_fats"),
+  standardize = TRUE
+)
+
+# R&R from scientific reports: adding child sex, birth mode, and still breastfeeding to covariates
+pandemic_species_covs <- Maaslin2(
+  input_data = "species_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_species_filtered_covariates_r1",
+  min_abundance = 0,
+  min_prevalence = 0.5, #filter to only look at taxa with 50% non-zero values (non-zero in 17/34)
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str", "avg_fats", "sex", "still_breastfeed", "method_delivery"),
+  standardize = TRUE
+)
+
+# still no significant differentially abundant species
+```
+
+## Targeted Analyses, family level
+Families are: Bifidobacteriaceae, Lactobacillaceae, Pasteurellaceae, Lachnospiraceae, Ruminococcaceae, Tannerellaceae, Bacteroidaceae, and Streptococcaceae. These are all families that show overlap between studies of stress, hygiene, daycare attendance, household composition, and the one COVID/microbiome study published (in adults)
+### Run full maasiln2 with all comparisons
+```{r, results='hide', warning=FALSE}
+#run full maasiln2 with all comparisons (without controlling for average fats)
+pandemic_family <- Maaslin2(
+  input_data = "family_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_family_targeted",
+  min_abundance = 0,
+  min_prevalence = 0.1, #lower filtering threshold to capture all of the families
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str"),
+  standardize = TRUE
+)
+
+#run maaslin2 controlling for average fats
+pandemic_family_covs <- Maaslin2(
+  input_data = "family_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_family_targeted_controlfats",
+  min_abundance = 0,
+  min_prevalence = 0.1, #lower filtering threshold to capture all of the families
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str", "avg_fats"),
+  standardize = TRUE
+)
+
+# R&R from scientific reports: adding child sex, method of delivery and still breastfeeding to covariates
+pandemic_family_r1covs <- Maaslin2(
+  input_data = "family_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_vars_edited.tsv",
+  output = "da_results/pandemic_family_filtered_covariates_r1",
+  min_abundance = 0,
+  min_prevalence = 0.5, #filter to only look at taxa with 50% non-zero values (non-zero in 17/34)
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("pandemic_str", "avg_fats", "sex", "still_breastfeed", "method_delivery"),
+  standardize = TRUE
+)
+```
+
+### Calculate correct q-value on subset of families of interest
+```{r}
+#WITHOUT COVARIATES
+#select families of interest, subset them, and recalculate q-value
+#grab results of interest
+da_results_families <- pandemic_family$results %>% 
+filter(grepl("Bifidobacteriaceae|Lactobacillaceae|Pasteurellaceae|Lachnospiraceae|Ruminococcaceae|Tannerellaceae|Bacteroidaceae|Streptococcaceae", feature))
+
+#generate correct q-value
+da_results_families$qval<-p.adjust(da_results_families$pval, method = 'BH')
+
+#write out the results of interest
+write_csv(da_results_families, "da_results/pandemic_family_targeted/targeted_family_results.csv")
+
+#CONTROLLING FOR AVERAGE FATS
+da_results_families_controlfats <- pandemic_family_covs$results %>% 
+  filter(grepl("Bifidobacteriaceae|Lactobacillaceae|Pasteurellaceae|Lachnospiraceae|Ruminococcaceae|Tannerellaceae|Bacteroidaceae|Streptococcaceae", feature))
+
+#generate correct q-value
+da_results_families_controlfats$qval<-p.adjust(da_results_families_controlfats$pval, method = 'BH')
+
+#write out the results of interest
+write_csv(da_results_families_controlfats, "da_results/pandemic_family_targeted/targeted_family_results_controlfats.csv")
+
+# CONTROLLING FOR COVARIATES IN R1 FOR SCIENTIFIC REPORTS
+da_results_families_r1covs <- pandemic_family_r1covs$results %>% 
+  filter(grepl("Bifidobacteriaceae|Lactobacillaceae|Pasteurellaceae|Lachnospiraceae|Ruminococcaceae|Tannerellaceae|Bacteroidaceae|Streptococcaceae", feature)) %>% filter(metadata=="pandemic_str")
+
+#generate correct q-value
+da_results_families_r1covs$qval<-p.adjust(da_results_families_r1covs$pval, method = 'BH')
+
+#write out the results of interest
+write_csv(da_results_families_r1covs, "da_results/pandemic_family_filtered_covariates_r1/targeted_family_results_r1covs.csv")
+```
+
+### Graph Pasteurellaceae results (Figure 4)
+```{r}
+#create smaller dataset with pandemic string variable and Blautia, unknown species abundance
+covid_metadata_family <- read_tsv("covid_metadata_vars_edited.tsv") %>% 
+  left_join(read_tsv("family_tax_features_covid.tsv"), by = '#SampleID') 
+
+covid_metadata_family <- covid_metadata_family %>% 
+  mutate(
+    taxa_count_per_sample = rowSums(dplyr::select(., contains("Bacteria")), na.rm=TRUE)
+  )
+
+#rename abundance variable for ease of plotting
+covid_metadata_family <- covid_metadata_family %>% 
+  mutate(
+    f__Lactobacillaceae_perc = `Bacteria;Firmicutes;Bacilli;Lactobacillales;Lactobacillaceae`/taxa_count_per_sample,
+    f__Pasteurellaceae_perc = `Bacteria;Proteobacteria;Gammaproteobacteria;Pasteurellales;Pasteurellaceae`/taxa_count_per_sample,
+  ) %>% 
+  dplyr::rename(
+    f__Lactobacillaceae = 'Bacteria;Firmicutes;Bacilli;Lactobacillales;Lactobacillaceae',
+    f__Pasteurellaceae = 'Bacteria;Proteobacteria;Gammaproteobacteria;Pasteurellales;Pasteurellaceae'
+  )
+
+#change the levels of pandemic string so that pre pandemic is first before during
+covid_metadata_family$pandemic_str <- factor(covid_metadata_family$pandemic_str, levels=c("pre", "during"))
+
+# create dataset that is complete on covariates
+covid_metadata_family_complete <- covid_metadata_family %>% dplyr::filter(!is.na(avg_fats) & !is.na(still_breastfeed) & !is.na(method_delivery) & !is.na(sex) & !is.na(pandemic))
+
+#Graph  
+  ggplot(covid_metadata_family %>% filter(!is.na(pandemic_str)), aes(y = f__Pasteurellaceae, x = pandemic_str, color=pandemic_str)) +
+geom_point(position=position_jitter(w=0.3, h=0), na.rm = TRUE) +
+  geom_boxplot(alpha=0.3, outlier.shape=NA, na.rm=TRUE, data=covid_metadata_family %>% filter(!is.na(pandemic_str))) +
+  #stat_summary(fun=mean, colour='#7570B3', geom='point', shape='-', size=15, na.rm=T) +
+  xlab("Pandemic Group") + ylab("Pasteurellaceae Count (per sample)") + 
+  scale_x_discrete("Pandemic Group", labels = c("pre" = "Pre-Pandemic", "during" = "Pandemic")) +
+  scale_color_brewer(palette = "Dark2") + #specify colorblind friendly color palette for color
+  theme_minimal() +
+  theme( 
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+  ) +
+  theme(legend.position = "none") 
+  #+ggtitle('B')
+
+ggsave("figures/Pasteurellaceae_prepost.svg", height=4, width=6, dpi=1000)
+
+# pasteur with complete cases only
+ggplot(covid_metadata_family_complete %>% filter(!is.na(pandemic_str)), aes(y = f__Pasteurellaceae, x = pandemic_str, color=pandemic_str)) +
+geom_point(position=position_jitter(w=0.3, h=0), na.rm = TRUE) +
+  geom_boxplot(alpha=0.3, outlier.shape=NA, na.rm=TRUE, data=covid_metadata_family %>% filter(!is.na(pandemic_str))) +
+  #stat_summary(fun=mean, colour='#7570B3', geom='point', shape='-', size=15, na.rm=T) +
+  xlab("Pandemic Group") + ylab("Pasteurellaceae Count (per sample)") + 
+  scale_x_discrete("Pandemic Group", labels = c("pre" = "Pre-Pandemic", "during" = "Pandemic")) +
+  scale_color_brewer(palette = "Dark2") + #specify colorblind friendly color palette for color
+  theme_minimal() +
+  theme( 
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+  ) +
+  theme(legend.position = "none") 
+  #+ggtitle('B')
+
+ggsave("figures/pasteur_complete.svg", height=4, width=6, dpi=1000)
+```
+
+# Differential Abundance Analyses by days since pandemic onset
+## Species-level 
+```{r, results='hide', warning=FALSE}
+#create subset of samples collected after pandemic onset
+postpand <- read_tsv("covid_metadata_vars_edited.tsv") %>% dplyr::filter(dist322>0) #N=20
+
+#write that file
+write_tsv(postpand, "covid_metadata_postpand_sample.tsv")
+
+#run full maasiln2 with all comparisons
+dist322_species <- Maaslin2(
+  input_data = "species_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_postpand_sample.tsv",
+  output = "da_results/dist322_species",
+  min_abundance = 0,
+  min_prevalence = 0.5, 
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("dist322"),
+  standardize = TRUE
+)
+
+#is average fat intake associated with days since pandemic onset?
+cor.test(postpand$dist322, postpand$avg_fats) #negative association (r=-0.5), marginal (p=0.08)
+
+postpand %>% dplyr::count(!is.na(avg_fats)) #13/20 have fat data though
+
+ggplot(postpand, aes(x=dist322, y=avg_fats)) + 
+  geom_point() +
+  geom_smooth(method="lm")
+#mostly driven by outlier with high fat early in pandemic and low fat later in pandemic
+```
+
+## Family-level
+```{r, results='hide', warning=FALSE}
+#run full maasiln2 with all comparisons
+dist322_family <- Maaslin2(
+  input_data = "family_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_postpand_sample.tsv",
+  output = "da_results/dist322_family",
+  min_abundance = 0,
+  min_prevalence = 0.5, 
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("dist322"),
+  standardize = TRUE
+)
+
+#WITHOUT COVARIATES
+#select families of interest, subset them, and recalculate q-value
+#grab results of interest
+da_dist322_families <- dist322_family$results %>% 
+filter(grepl("Bifidobacteriaceae|Lactobacillaceae|Pasteurellaceae|Lachnospiraceae|Ruminococcaceae|Tannerellaceae|Bacteroidaceae|Streptococcaceae", feature))
+
+#generate correct q-value
+da_dist322_families$qval<-p.adjust(da_dist322_families$pval, method = 'BH')
+
+#write out the results of interest
+write_csv(da_dist322_families, "da_results/dist322_family/dist322_targeted_results.csv")
+
+```
+
+## Genus-level
+```{r, results='hide', warning=FALSE}
+#run full maasiln2 with all comparisons
+dist322_genus <- Maaslin2(
+  input_data = "genus_tax_features_covid.tsv",
+  input_metadata = "covid_metadata_postpand_sample.tsv",
+  output = "da_results/dist322_genus",
+  min_abundance = 0,
+  min_prevalence = 0.5, 
+  max_significance = 0.25, 
+  analysis_method = "lm", #default
+  normalization = "TSS", #default
+  transform = "LOG", #default
+  fixed_effects = c("dist322"),
+  standardize = TRUE
+)
+```
+
